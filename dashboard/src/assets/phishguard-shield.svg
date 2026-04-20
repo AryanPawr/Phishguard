@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">PhishGuard shield</title>
+  <rect width="128" height="128" rx="8" fill="#ffffff"/>
+  <path d="M64 12l42 16v32c0 28-17 48-42 58-25-10-42-30-42-58V28l42-16z" fill="#159947"/>
+  <path d="M64 25l28 11v23c0 19-10 34-28 43-18-9-28-24-28-43V36l28-11z" fill="#ffffff"/>
+  <path d="M50 63l9 10 21-26" fill="none" stroke="#159947" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M84 86l18 18" stroke="#171717" stroke-width="9" stroke-linecap="round"/>
+</svg>
+

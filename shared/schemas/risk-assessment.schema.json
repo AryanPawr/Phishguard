@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.phishguard.local/risk-assessment.schema.json",
+  "title": "PhishGuard Risk Assessment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["risk_score", "classification", "confidence", "reasons"],
+  "properties": {
+    "risk_score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "classification": { "enum": ["safe", "suspicious", "phishing"] },
+    "confidence": { "enum": ["low", "medium", "high"] },
+    "reasons": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "model_version": { "type": "string" },
+    "sample_hash": { "type": "string" },
+    "impersonated_brand": { "type": ["string", "null"] },
+    "components": {
+      "type": "object",
+      "additionalProperties": { "type": "number" }
+    }
+  }
+}
+

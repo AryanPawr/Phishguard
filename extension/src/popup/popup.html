@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PhishGuard</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="title">PhishGuard</div>
+        <div class="subtitle">Current email</div>
+      </header>
+
+      <section id="status" class="status">Open an email, then choose an action.</section>
+
+      <section id="result" class="result" hidden>
+        <div class="result-row">
+          <span>Risk</span>
+          <strong id="riskScore">0%</strong>
+        </div>
+        <div class="result-row">
+          <span>Class</span>
+          <strong id="classification">unknown</strong>
+        </div>
+        <div class="result-row">
+          <span>Domain</span>
+          <strong id="domain">unknown</strong>
+        </div>
+        <ul id="reasons"></ul>
+      </section>
+
+      <section class="actions">
+        <button id="analyze" type="button">Analyze current email</button>
+        <button id="reportRisky" type="button">Report risky</button>
+        <button id="markNotRisky" type="button" class="secondary">Mark not risky</button>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

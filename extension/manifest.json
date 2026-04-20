@@ -1,0 +1,56 @@
+{
+  "manifest_version": 3,
+  "name": "PhishGuard",
+  "version": "0.1.0",
+  "description": "Privacy-preserving phishing risk detection for webmail and email-rendered pages.",
+  "permissions": ["storage", "activeTab"],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "https://mail.google.com/*",
+    "https://outlook.live.com/*",
+    "https://outlook.office.com/*",
+    "https://outlook.office365.com/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background/serviceWorker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": [
+        "src/utils/logger.js",
+        "src/utils/hash.js",
+        "src/utils/storage.js",
+        "src/heuristics/keywordEngine.js",
+        "src/heuristics/linkAnalyzer.js",
+        "src/heuristics/domainMismatch.js",
+        "src/heuristics/spoofDetector.js",
+        "src/heuristics/localScorer.js",
+        "src/ui/tooltip.js",
+        "src/ui/badge.js",
+        "src/ui/riskBanner.js",
+        "src/content/gmail/extractor.js",
+        "src/content/outlook/extractor.js",
+        "src/content/generic/extractor.js",
+        "src/content/domObserver.js",
+        "src/content/injector.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'self' http://localhost:8000 https://api.phishguard.local"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "phishguard@example.local",
+      "strict_min_version": "109.0"
+    }
+  },
+  "action": {
+    "default_title": "PhishGuard",
+    "default_popup": "src/popup/popup.html"
+  }
+}

@@ -1,0 +1,2847 @@
+PHISHGUARD TECHNICAL DEEP DIVE
+Plain text architecture and implementation documentation
+
+Project root:
+phishguard/
+
+Primary purpose:
+This document explains what was built, why it was built that way, what tradeoffs were made, and how the components interact. It is written as technical mentoring material for a junior security engineer who needs to understand the architecture rather than simply run the project.
+
+
+------------------------------------------------------------------
+1. EXECUTIVE OVERVIEW
+------------------------------------------------------------------
+
+1.1 What is PhishGuard?
+
+PhishGuard is a modular phishing detection platform composed of:
+
+- A browser extension for detecting and extracting email-like content from Gmail Web, Outlook Web, and generic web-rendered email pages.
+- A FastAPI backend that validates analysis requests, extracts structured phishing features, performs ML inference, performs rule-based brand impersonation detection, fuses multiple risk signals, stores anonymized telemetry, and exposes administrative analytics.
+- A structured machine learning pipeline using TF-IDF text vectors plus numeric security features and a Logistic Regression baseline.
+- A local threat intelligence registry containing known brands, verified domains, spoofing patterns, suspicious TLDs, and example phishing rules.
+- A React + Tailwind dashboard for administrative review of aggregate risk trends, impersonated brands, recent hashed events, and SIEM export data.
+- Infrastructure files for local Docker-based execution and an nginx reverse proxy example.
+- Tests covering feature extraction, scoring, API behavior, ML training, spoof detection, and extension manifest safety properties.
+
+The important architectural idea is that PhishGuard is not a single phishing classifier. It is a detection system that combines several independent signals:
+
+- Client-side heuristics
+- Server-side structured feature extraction
+- ML probability
+- Brand impersonation score
+- Link reputation score
+- Domain registry mismatch score
+
+This multi-signal approach is deliberate. Phishing detection is adversarial. A single signal can be bypassed or produce poor explanations. Combining independent signals gives the system more resilience and better operator-facing reasons.
+
+
+1.2 System goals
+
+The project was built to demonstrate:
+
+- Browser extension engineering:
+  Extract email context from complex webmail DOMs.
+  Run lightweight local heuristics.
+  Protect privacy before sending data to a backend.
+  Render a user-facing risk banner without breaking the host page.
+
+- Secure backend architecture:
+  Validate every incoming request.
+  Keep raw email content out of persistent storage.
+  Apply JWT authentication to administrative routes.
+  Separate API, service, persistence, and security concerns.
+
+- Structured ML pipeline:
+  Convert email content into repeatable numeric and text features.
+  Train a baseline model that can be inspected, tested, and replaced later.
+  Keep training and inference using the same feature extraction path.
+
+- Threat intelligence:
+  Maintain a verified brand-domain registry.
+  Detect likely brand spoofing.
+  Provide an extensible place for future feeds such as PhishTank and OpenPhish.
+
+- Brand impersonation detection:
+  Detect mismatches between sender identity and verified brand domains.
+  Detect lookalike domains using edit distance.
+  Detect punycode and homoglyph abuse.
+
+- Analytics:
+  Store anonymized analysis metadata.
+  Show risk distribution, trends, impersonated brands, and recent hashed events.
+
+- SIEM readiness:
+  Export JSON events that map naturally to Elastic Common Schema style fields.
+
+
+1.3 Threat model
+
+The primary adversary is a phishing actor attempting to trick a user into trusting an email or email-rendered page. The adversary may:
+
+- Use urgency or fear-based language.
+- Ask for credentials, payment updates, or identity confirmation.
+- Use domains that resemble known brands.
+- Use URL anchor text that displays one domain but links to another.
+- Use suspicious TLDs, percent encoding, IP-address URLs, or heavy subdomain chains.
+- Impersonate a known brand in the display name while sending from an unrelated domain.
+- Use punycode or visually similar Unicode characters.
+- Hide form fields or embed credential-harvesting forms.
+
+The project also assumes several secondary threats:
+
+- A malicious or compromised website could try to interfere with injected UI.
+- A hostile input payload could try to exploit backend parsing or storage paths.
+- An attacker could flood the analysis endpoint.
+- An administrator token could be stolen if stored carelessly.
+- Raw email content could become sensitive evidence and should not be persisted.
+
+The project does not claim to solve every enterprise email security problem. It is a portfolio-grade platform scaffold that demonstrates good architecture, privacy boundaries, and upgrade paths.
+
+
+1.4 Design philosophy
+
+The design follows these principles:
+
+- Keep detection layered.
+  Client heuristics should catch obvious issues quickly. Server analysis should perform deeper extraction, ML inference, and intelligence checks. Dashboard analytics should operate only on anonymized events.
+
+- Keep privacy boundaries explicit.
+  Raw email content is useful for detection but dangerous to persist. The extension masks PII before transmission. The backend masks again before feature extraction and stores only hashes, domains, scores, classifications, and reasons.
+
+- Keep ML replaceable.
+  The baseline model is intentionally simple. The interfaces are arranged so DistilBERT, ONNX, or another model can later replace the current joblib artifact without rewriting the API.
+
+- Keep explanations first-class.
+  Phishing detection must produce reasons. A user or analyst needs to know why a message was classified as suspicious. Pure probability alone is not enough.
+
+- Keep modules independent.
+  Feature extraction, impersonation detection, reputation, ML inference, scoring, storage, API routing, and UI rendering live in separate files because they change for different reasons.
+
+- Prefer production-shaped scaffolding over toy code.
+  The project uses a repository layer, Pydantic request validation, FastAPI routers, environment configuration, JWT auth, Docker files, and tests because those are the patterns expected in a production-grade system.
+
+
+------------------------------------------------------------------
+2. SYSTEM ARCHITECTURE OVERVIEW
+------------------------------------------------------------------
+
+2.1 High-level component diagram
+
+Textual system diagram:
+
+User browser
+  |
+  | 1. User opens Gmail, Outlook Web, or a generic rendered email page
+  v
+Browser extension content scripts
+  |
+  | 2. Extract sender, display name, subject, body text, links, anchor text, domain
+  | 3. Run local heuristics
+  | 4. Mask PII and compute cache key
+  v
+Extension background service worker
+  |
+  | 5. Check local safe-result cache
+  | 6. Send masked suspicious/cached-miss payload to backend
+  v
+FastAPI backend
+  |
+  | 7. Validate request with Pydantic
+  | 8. Mask again server-side
+  | 9. Extract structured features
+  | 10. Run ML inference
+  | 11. Run impersonation detection
+  | 12. Run reputation checks
+  | 13. Fuse scores
+  | 14. Persist anonymized event
+  v
+Risk assessment response
+  |
+  | 15. Extension injects risk banner
+  v
+User sees safe / suspicious / phishing classification
+
+Separate admin path:
+
+Admin browser
+  |
+  | Login with username/password
+  v
+FastAPI admin API
+  |
+  | Issues JWT
+  v
+React dashboard
+  |
+  | Calls JWT-protected summary, recent, trends, brands, and SIEM endpoints
+  v
+Anonymized analytics and SIEM JSON
+
+
+2.2 Extension to backend to ML to dashboard flow
+
+The extension is the first point of contact because phishing risk exists inside a browser-rendered email view. Browser extensions can inspect the DOM of webmail pages after the message is rendered. This is important because Gmail and Outlook do not expose a universal local API for arbitrary extensions to access email content. The DOM is the practical integration point.
+
+After extraction, the extension performs local heuristics. The purpose is not to make the final decision locally. The purpose is to avoid unnecessary backend calls for obviously safe low-signal pages and to add a client-side heuristic score to the backend's final scoring formula.
+
+The backend receives only a normalized analysis request. It does not care whether the source is Gmail, Outlook, a generic page, or a direct API call. This is why the extension extractors normalize into the same fields:
+
+- sender_email
+- display_name
+- subject
+- body_text
+- html
+- links
+- domain
+- heuristic_score
+- client_reasons
+- source
+
+The backend extracts features from this normalized payload. These features are then reused by:
+
+- ML inference
+- impersonation detection
+- scoring
+- anonymized analytics
+
+The dashboard does not receive raw email content. It receives only aggregated counts, trend values, top brand names, hashed event identifiers, domains, risk scores, classifications, and reason strings.
+
+
+2.3 Data boundaries and trust boundaries
+
+Trust boundary 1: Web page DOM to extension
+
+The page DOM is untrusted. A web page can contain arbitrary content and can be shaped by an attacker. The extension should treat extracted text, links, domains, and attributes as hostile input. The current implementation normalizes and masks values before sending them to the backend. It also avoids evaluating page-provided scripts.
+
+Trust boundary 2: Extension to backend
+
+The backend cannot trust the extension request. Even though the intended caller is the PhishGuard extension, any HTTP client can call the API. Therefore the backend performs Pydantic validation, length limits, type checks, and server-side masking.
+
+Trust boundary 3: Backend analysis API to database
+
+Raw input must not cross into persistence. The analyze route computes hashes and stores only anonymized telemetry. This boundary is important because databases tend to have broader access patterns than in-memory request handlers. Persisting raw email content would increase legal, privacy, and breach impact.
+
+Trust boundary 4: Admin API to dashboard
+
+Admin analytics are protected by JWT. The dashboard stores the token in localStorage for a simple portfolio scaffold. In a production enterprise deployment, token storage would require additional hardening such as short lifetimes, refresh token rotation, secure cookies, or an identity provider.
+
+Trust boundary 5: SIEM export
+
+SIEM export is also protected by JWT. SIEM pipelines often replicate data widely. The export intentionally contains hashed indicators and reasons rather than raw message bodies.
+
+
+------------------------------------------------------------------
+3. FRONTEND (BROWSER EXTENSION)
+------------------------------------------------------------------
+
+3.1 Manifest V3 explanation
+
+The extension uses Manifest V3. The manifest declares:
+
+- manifest_version: 3
+- name, version, description
+- storage permission
+- host permissions for localhost backend, Gmail, Outlook, and generic HTTP/HTTPS pages
+- a background service worker at src/background/serviceWorker.js
+- content scripts injected into HTTP/HTTPS pages
+- a strict extension page CSP
+- Firefox browser_specific_settings
+- an action title
+
+Manifest V3 changes the extension execution model. Instead of a persistent background page, background logic runs inside an event-driven service worker. That makes background code more constrained but also more aligned with modern browser security and performance requirements.
+
+
+3.2 Why Manifest V3 over V2
+
+Manifest V3 was chosen because:
+
+- Chrome has moved extension development toward MV3.
+- MV2 support is deprecated or restricted in Chromium-based browsers.
+- MV3 encourages a narrower execution model by using service workers.
+- MV3 reduces the risk of long-running background scripts silently collecting data.
+- MV3 is the realistic target for a modern portfolio extension.
+
+Manifest V2 would be simpler for some background tasks because persistent background pages are easier to reason about. However, using MV2 would make the project feel outdated and less deployable. A security portfolio project should target the current browser extension model.
+
+
+3.3 Background service worker purpose
+
+File:
+extension/src/background/serviceWorker.js
+
+The background service worker has three responsibilities:
+
+1. Initialize default settings on install.
+2. Listen for analysis messages from content scripts.
+3. Delegate backend communication and caching behavior to apiClient.js.
+
+The service worker is intentionally small. It does not parse DOM content. It does not own phishing detection logic. It acts as a privileged communication bridge because content scripts are page-facing and should not directly own every background-level concern.
+
+The service worker calls:
+
+apiClient.analyze(message.payload, message.cacheKey)
+
+It returns either:
+
+- { ok: true, result }
+- { ok: false, error }
+
+This shape keeps content script error handling simple.
+
+
+3.4 Content scripts design
+
+Content scripts are split into several categories:
+
+- Extractors:
+  content/gmail/extractor.js
+  content/outlook/extractor.js
+  content/generic/extractor.js
+
+- Orchestration:
+  content/domObserver.js
+  content/injector.js
+
+- Heuristics:
+  heuristics/keywordEngine.js
+  heuristics/linkAnalyzer.js
+  heuristics/domainMismatch.js
+  heuristics/spoofDetector.js
+  heuristics/localScorer.js
+
+- UI:
+  ui/riskBanner.js
+  ui/tooltip.js
+  ui/badge.js
+
+- Utilities:
+  utils/hash.js
+  utils/storage.js
+  utils/logger.js
+
+This separation matters because Gmail extraction is a different problem from Outlook extraction, and both are different from rendering a banner or hashing a payload. If all content-script logic lived in one file, changes to Gmail selectors could accidentally break privacy masking or UI rendering.
+
+Each extractor exposes:
+
+- canHandle()
+- extract()
+
+The injector selects the first extractor whose canHandle() returns true. This strategy allows additional providers to be added later without changing the rest of the extension.
+
+
+3.5 DOM observation logic
+
+File:
+extension/src/content/domObserver.js
+
+Webmail applications are single-page applications. Opening a new email often does not reload the page. Gmail and Outlook update the DOM dynamically. Therefore a one-time extraction at page load is not enough.
+
+The DOM observer uses MutationObserver on document.body or document.documentElement. It watches:
+
+- childList changes
+- subtree changes
+
+It also listens for:
+
+- hashchange
+- popstate
+
+The observer debounces calls by using a timer. This matters because webmail pages can generate many DOM mutations for a single email open. Running detection on every mutation would waste CPU and spam the backend.
+
+The observer schedules analysis after 600 ms. This gives the page time to settle and reduces duplicate analysis.
+
+
+3.6 Heuristics implementation
+
+The extension implements multiple local heuristics:
+
+keywordEngine.js:
+Detects urgency, credential request language, and financial pressure terms. These phrases are common phishing lures. The engine returns a score, reasons, and lightweight feature counts.
+
+linkAnalyzer.js:
+Detects anchor mismatch, IP-host links, suspicious TLDs, and URL percent encoding. Anchor mismatch is especially important because many phishing emails display a trusted domain while linking elsewhere.
+
+domainMismatch.js:
+Compares brand mentions in display name or subject against known verified brand domains. For example, a display name mentioning PayPal from a non-PayPal domain is suspicious.
+
+spoofDetector.js:
+Looks for punycode, homoglyph indicators, repeated spoof terms, and excessive hyphenation. These are common lookalike-domain tactics.
+
+localScorer.js:
+Combines local heuristic subscores into one heuristic_score using weights:
+
+- keyword score: 25%
+- link score: 35%
+- domain mismatch score: 25%
+- spoof score: 15%
+
+The local score is not the final score. It is one input into the backend scoring formula.
+
+
+3.7 PII masking logic
+
+File:
+extension/src/utils/hash.js
+
+The extension masks PII before the backend call.
+
+It masks:
+
+- email addresses in text
+- phone-like values
+- long token-like strings
+- sender local-part
+
+The sender is transformed so that only the domain remains:
+
+original:
+alice@example.com
+
+masked:
+[local]@example.com
+
+This preserves the security signal from the sender domain while removing the personal mailbox identifier.
+
+The extension also computes a SHA-256 hash of the masked payload. This hash is used as a safe-result cache key. The cache key is based on masked data, not raw email content.
+
+Raw HTML is set to null in the extension payload. This is a privacy-first choice. The backend supports html because structural feature extraction can inspect form tags and hidden elements, but the extension defaults away from sending raw HTML to reduce exposure.
+
+
+3.8 Risk banner injection mechanism
+
+File:
+extension/src/ui/riskBanner.js
+
+The risk banner is injected directly into the page as a fixed-position section. The code:
+
+- creates a single style tag if one does not already exist
+- removes the existing banner before rendering a new one
+- creates a section with role="status"
+- sets aria-live="polite"
+- displays classification, score, confidence, and up to four reasons
+- escapes reason text before injecting it into HTML
+- adds a close button
+- writes the classification into documentElement.dataset through badge.js
+
+The banner uses a very high z-index so it appears above webmail UI. This is a practical extension UI tradeoff. It must be visible, but it may occasionally overlap page controls. A production extension could add user-configurable position or a browser action popup.
+
+The banner escapes reason strings because reasons may include content derived from detection inputs. Escaping prevents reason text from becoming an injection vector.
+
+
+3.9 Cross-browser compatibility handling
+
+Files:
+extension/src/background/apiClient.js
+extension/src/utils/storage.js
+
+Chrome historically exposes extension APIs through chrome.* with callback-style functions. Firefox commonly supports browser.* with Promise-style functions. The API client detects:
+
+typeof browser !== "undefined" ? browser : chrome
+
+Storage wrappers then support both styles:
+
+- If storage.local.get returns a promise, await it.
+- Otherwise wrap the callback version in a Promise.
+
+This allows the same logical code to work across Chrome and Firefox. The compatibility layer is intentionally small and placed around storage because that is where the current extension needs async cross-browser behavior.
+
+The current injector still uses chrome.runtime.sendMessage. For a production Firefox package, the same browser/chrome adapter pattern should be extended to runtime messaging as well. The manifest includes Firefox settings, and the storage compatibility path is in place, but runtime messaging is an area to harden further.
+
+
+3.10 Rate-limit handling strategy
+
+File:
+extension/src/background/apiClient.js
+
+If the backend returns HTTP 429, the API client reads the Retry-After header and throws an Error with retryAfterSeconds. The service worker wraps that into the response sent back to the content script.
+
+This avoids repeatedly hammering the backend after rate limiting begins. The current UI displays an error banner. A future version could suppress reattempts until retryAfterSeconds has elapsed.
+
+Safe results are cached locally. This also reduces backend traffic because repeated views of the same masked low-risk message can use cached output.
+
+
+3.11 Security considerations in extension
+
+Security controls:
+
+- Strict extension CSP:
+  script-src 'self'; object-src 'none'
+
+- Minimal extension permissions:
+  The extension requests storage but avoids tabs, history, cookies, downloads, clipboard, and broad browser data permissions.
+
+- PII masking before API call:
+  Privacy protection begins client-side.
+
+- No raw email storage:
+  The extension stores safe result cache entries keyed by masked payload hash.
+
+- Link metadata only:
+  Links are sent as URL and masked anchor text. The extension does not collect browser history.
+
+- Escaped UI reasons:
+  Prevents reason text from injecting HTML.
+
+- No remote script execution:
+  Content scripts are packaged with the extension.
+
+Security tradeoff:
+The manifest includes broad http://*/* and https://*/* host permissions to support generic email-rendered websites. This is useful for portfolio coverage but broader than an enterprise-controlled deployment would prefer. A production extension could narrow host permissions or use optional host permissions.
+
+
+3.12 Why local heuristics were implemented instead of fully server-side scanning
+
+Local heuristics exist for several reasons:
+
+- Latency:
+  Some obvious signals can be detected immediately without a network round trip.
+
+- Privacy:
+  Low-signal messages with no links can avoid backend submission.
+
+- Resilience:
+  If the backend is unavailable, the extension can still render some local assessment.
+
+- Defense in depth:
+  The backend receives not only raw normalized fields but also client observations.
+
+- Cost control:
+  Server calls and future ML inference are more expensive than local string checks.
+
+Fully server-side scanning would simplify client code but would increase data transfer, centralize sensitive data processing, and remove a useful first-pass filter.
+
+
+3.13 Tradeoffs of extension-based detection
+
+Advantages:
+
+- Works where the user reads email.
+- Can inspect rendered HTML and anchor text after webmail sanitization.
+- Provides real-time user feedback.
+- Does not require mail server integration.
+
+Disadvantages:
+
+- Webmail DOM selectors are fragile.
+- Extensions require browser installation and permissions.
+- The extension sees content only when a user opens a message.
+- Host pages can change UI structure at any time.
+- Generic web detection may produce false positives on non-email pages.
+- Extension UI can conflict with page layout.
+
+This project chooses extension-based detection because it demonstrates client-side security engineering and provides immediate user feedback. It is not a replacement for secure email gateway scanning.
+
+
+------------------------------------------------------------------
+4. BACKEND (FASTAPI)
+------------------------------------------------------------------
+
+4.1 Why FastAPI was chosen
+
+FastAPI was chosen because it fits this project well:
+
+- It provides strong request validation through Pydantic.
+- It generates OpenAPI documentation automatically.
+- It has good async support while still allowing synchronous service code.
+- It is lightweight enough for a portfolio project.
+- It is common in ML-serving and security tooling prototypes.
+- It has clean dependency injection for database sessions and auth dependencies.
+
+Alternatives considered:
+
+- Flask:
+  Simpler but lacks first-class typed request validation and OpenAPI support without more add-ons.
+
+- Django:
+  Strong batteries-included framework but heavier than needed for a detection API and lightweight dashboard backend.
+
+- Node/Express:
+  Good ecosystem, but Python is better aligned with scikit-learn, pandas, joblib, and ML feature extraction.
+
+- Go:
+  Excellent for performance, but less convenient for the Python ML pipeline required here.
+
+
+4.2 API structure explanation
+
+Backend API files:
+
+- app/api/analyze.py
+  Public analysis endpoint. Receives normalized message payloads and returns risk assessment.
+
+- app/api/admin.py
+  Admin login and analytics endpoints. Protected by JWT except login.
+
+- app/api/siem.py
+  JWT-protected SIEM JSON export endpoint.
+
+- app/main.py
+  FastAPI application setup, middleware, health route, startup database initialization, and router mounting.
+
+The API structure separates different access patterns:
+
+- Analysis API is called by browser extensions or direct clients.
+- Admin API is called by the dashboard.
+- SIEM API is called by administrative export tooling.
+
+This prevents the analyze route from becoming a dumping ground for unrelated administrative behavior.
+
+
+4.3 JWT authentication reasoning
+
+Admin and SIEM routes use bearer JWTs. The login endpoint checks configured admin credentials and issues a token with:
+
+- sub
+- exp
+- scope: admin
+
+JWT was chosen because:
+
+- It is easy for the React dashboard to include in Authorization headers.
+- It avoids server-side session storage in the scaffold.
+- It works well for APIs consumed by browser apps and SIEM clients.
+- It can later be replaced by or integrated with SSO/OIDC.
+
+JWT limitations:
+
+- Token revocation is not implemented.
+- LocalStorage storage in the dashboard is simple but not ideal for high-security production.
+- A single admin user is configured through environment variables.
+
+Production improvements:
+
+- Use an identity provider.
+- Use short token lifetimes.
+- Add refresh token rotation or secure cookie sessions.
+- Add role-based access control.
+- Add audit logging for admin activity.
+
+
+4.4 Request validation
+
+AnalyzeRequest in analyze.py validates:
+
+- sender_email max length 320
+- display_name max length 256
+- subject max length 512
+- body_text max length 50000
+- html max length 120000
+- links max length 200
+- each link href max length 2048
+- each anchor_text max length 512
+- domain max length 255
+- heuristic_score between 0 and 1
+- client_reasons max length 25
+- source limited to gmail, outlook, generic, or api
+
+This is a security boundary. The backend expects untrusted input. Length limits reduce memory abuse, parsing abuse, and accidental storage bloat. Type constraints reduce unexpected runtime behavior.
+
+The client_reasons validator clamps each reason to 240 characters. This prevents a malicious client from sending extremely large explanation strings into logs, database records, or UI rendering.
+
+
+4.5 Rate limiting design
+
+RateLimitMiddleware in core/security.py applies a simple in-memory per-client per-minute limit.
+
+Design:
+
+- Identify client by X-Forwarded-For first value or request.client.host.
+- Compute current minute window.
+- Count requests per key.
+- Remove stale buckets.
+- Return 429 with Retry-After when the count exceeds configured limit.
+
+Why this approach:
+
+- It is enough for a local portfolio scaffold.
+- It demonstrates where rate limiting belongs.
+- It avoids introducing Redis before the project needs it.
+
+Limitations:
+
+- In-memory counters do not work across multiple backend instances.
+- Process restarts clear the counters.
+- X-Forwarded-For requires a trusted proxy configuration.
+- It is not a substitute for API gateway or WAF rate limiting.
+
+Production upgrade:
+Move rate limiting to Redis, Envoy, nginx, Cloudflare, or another edge-aware component.
+
+
+4.6 CORS strategy
+
+The backend config includes:
+
+- explicit dashboard origins:
+  http://localhost:5173
+  http://127.0.0.1:5173
+
+- extension origin regex:
+  ^(chrome-extension|moz-extension)://[A-Za-z0-9_-]+$
+
+This is stricter than allowing all origins. Browser extensions have dynamic generated IDs, so exact origins can be difficult during development. The regex permits extension schemes while still excluding arbitrary web origins.
+
+Tradeoff:
+The regex is broad for extensions. Production deployments could restrict to known extension IDs once published.
+
+
+4.7 Database schema explanation
+
+The database model is EmailAnalysisEvent.
+
+Stored fields:
+
+- id:
+  Primary key.
+
+- sample_hash:
+  SHA-256 hash of selected raw payload fields. Used to identify repeated samples without storing content.
+
+- sender_hash:
+  HMAC hash of sender value using server secret. Used for privacy-preserving correlation.
+
+- subject_hash:
+  HMAC hash of subject value.
+
+- domain:
+  Normalized sender/domain signal. Domains are retained because they are security indicators.
+
+- source:
+  gmail, outlook, generic, or api.
+
+- risk_score:
+  Final normalized score.
+
+- classification:
+  safe, suspicious, or phishing.
+
+- confidence:
+  low, medium, or high.
+
+- impersonated_brand:
+  Likely brand when detected.
+
+- reasons_json:
+  JSON-encoded list of explanations.
+
+- features_json:
+  JSON-encoded features excluding body_text.
+
+- created_at:
+  Timestamp for trend analysis and SIEM export.
+
+The schema intentionally does not store:
+
+- raw sender email
+- raw subject
+- raw body
+- raw HTML
+- raw display name
+
+This is the privacy boundary in database form.
+
+
+4.8 Repository pattern usage
+
+File:
+app/database/repository.py
+
+EventRepository owns persistence operations:
+
+- create_event
+- summary
+- recent
+- risk_trends
+- top_brands
+- siem_events
+
+The API routes do not directly write SQLAlchemy queries except through repository calls. This improves separation of concerns:
+
+- API routes handle HTTP and request/response shape.
+- Services handle detection logic.
+- Repository handles database access.
+
+This structure makes it easier to later swap SQLite for PostgreSQL or change query implementation without rewriting routers.
+
+
+4.9 Privacy boundary: hashing and masking
+
+The privacy logic lives in core/security.py:
+
+- mask_pii_text
+- mask_email_address
+- canonical_hash
+- hmac_hash
+- mask_payload
+
+The backend masks again even though the extension already masks. This is deliberate. Never trust clients to enforce privacy or security controls.
+
+canonical_hash:
+Creates a deterministic SHA-256 hash of selected payload values. It is useful for sample identity.
+
+hmac_hash:
+Uses server secret to hash sender and subject. HMAC prevents simple dictionary reversal when the input space is guessable. A plain SHA-256 hash of common subjects could be brute-forced. HMAC makes that much harder because the attacker would need the secret.
+
+mask_payload:
+Creates a sanitized copy of the analysis payload before feature extraction. The system extracts security signals from masked values where possible.
+
+Tradeoff:
+Masking can remove some useful ML signal. For example, local-part patterns may sometimes indicate phishing. The project prioritizes privacy over maximum signal capture.
+
+
+4.10 SIEM export logic
+
+File:
+app/api/siem.py
+
+The SIEM endpoint returns:
+
+- schema
+- format
+- count
+- events
+
+Repository method siem_events maps database rows to event-style keys:
+
+- event.kind
+- event.category
+- event.type
+- event.module
+- event.created
+- threat.indicator.type
+- threat.indicator.confidence
+- phishguard.sample_hash
+- phishguard.sender_hash
+- phishguard.subject_hash
+- phishguard.domain
+- phishguard.risk_score
+- phishguard.classification
+- phishguard.impersonated_brand
+- phishguard.reasons
+
+This shape is intentionally close to Elastic Common Schema conventions while preserving PhishGuard-specific fields.
+
+SIEM export is JWT-protected because even anonymized security telemetry can reveal organizational patterns.
+
+
+4.11 Why this structure was chosen instead of monolithic single-file API
+
+A monolithic API file would be shorter initially, but it would mix:
+
+- HTTP routing
+- validation models
+- feature extraction
+- ML loading
+- detection rules
+- scoring
+- persistence
+- auth
+- SIEM mapping
+
+That is difficult to test and difficult to modify. Security systems change constantly. Threat intelligence changes. ML changes. UI data needs change. Keeping modules separate allows independent evolution.
+
+The current structure follows production service boundaries:
+
+- api/
+- services/
+- intelligence/
+- database/
+- core/
+
+This makes the project easier to explain, extend, test, and review.
+
+
+4.12 Backend tradeoffs
+
+Chosen tradeoffs:
+
+- SQLite for local demo rather than PostgreSQL:
+  Easier setup. Not ideal for concurrent production workloads.
+
+- In-memory rate limiting:
+  Simple and visible. Not distributed.
+
+- Single admin credential:
+  Minimal admin auth scaffold. Not enterprise RBAC.
+
+- Joblib model loading:
+  Practical for scikit-learn. Not ideal for high-scale model serving.
+
+- Synchronous route logic:
+  Easy to understand. Could be moved to async workers for heavier models or feed lookups.
+
+
+------------------------------------------------------------------
+5. FEATURE EXTRACTION PIPELINE
+------------------------------------------------------------------
+
+5.1 Why structured feature extraction was chosen
+
+Phishing detection is not only a natural language problem. Many high-signal indicators are structural:
+
+- URL mismatch
+- sender domain mismatch
+- suspicious TLD
+- punycode
+- subdomain depth
+- hidden form elements
+- IP-based URLs
+
+A pure text model may miss or underweight these features. A structured feature pipeline makes these signals explicit, testable, and explainable.
+
+The pipeline lives in:
+
+app/services/feature_extraction/
+
+pipeline.py calls:
+
+- extract_text_features
+- extract_link_features
+- extract_domain_features
+- extract_structural_features
+
+The output is one dictionary consumed by ML, impersonation detection, scoring, and telemetry.
+
+
+5.2 text_features.py
+
+Purpose:
+Extract language-based phishing indicators from subject and body text.
+
+Features:
+
+- body_text:
+  Normalized combined subject and body text used by the ML TF-IDF branch.
+
+- word_count:
+  Captures message length. Extremely short urgent messages and longer scripted lures may behave differently.
+
+- unique_word_ratio:
+  Captures repetition. Phishing templates may reuse terms or be formulaic.
+
+- uppercase_ratio:
+  Captures shouting or urgency formatting.
+
+- exclamation_count:
+  Captures pressure or urgency.
+
+- urgency_keyword_count:
+  Counts phrases such as urgent, final notice, immediately, limited time.
+
+- credential_phrase_count:
+  Counts credential-harvesting phrases such as verify your account and sign in to verify.
+
+- high_risk_phrase_count:
+  Counts curated phrases such as unusual sign-in, payment failed, account suspended.
+
+Threat signals captured:
+
+- Social engineering pressure
+- Credential harvesting intent
+- Payment or account recovery lures
+- Urgent language patterns
+
+Why phrase counts instead of only TF-IDF:
+TF-IDF may learn these terms from training data, but explicit counts preserve explainability and can work even before the model is trained.
+
+
+5.3 link_features.py
+
+Purpose:
+Extract URL and anchor-text risk indicators.
+
+Features:
+
+- url_count:
+  Number of URLs. Phishing often includes a small number of call-to-action links, but high link count can also be suspicious in some templates.
+
+- anchor_mismatch_flag:
+  Whether visible anchor text contains a domain that does not match the destination domain.
+
+- anchor_mismatch_count:
+  Number of mismatched links.
+
+- url_entropy_avg:
+  Average Shannon entropy of URLs. High entropy may indicate randomized paths, tokens, or obfuscation.
+
+- url_entropy_max:
+  Maximum URL entropy.
+
+- ip_based_url_flag:
+  Flags URLs using IP addresses instead of domain names.
+
+- suspicious_tld_score:
+  Fraction of links using suspicious TLDs from the local registry.
+
+- encoded_character_count:
+  Counts heavy percent encoding.
+
+Threat signals captured:
+
+- Deceptive links
+- Obfuscated URLs
+- Suspicious infrastructure
+- IP-address hosting
+- Disposable or abused TLDs
+
+Alternative approaches:
+
+- Full URL reputation API:
+  Higher signal but requires network calls, API keys, cost, latency, and privacy review.
+
+- Browser safe browsing APIs:
+  Useful but vendor-dependent.
+
+- WHOIS/domain age:
+  Valuable but expensive and rate-limited.
+
+This project uses local deterministic features first.
+
+
+5.4 domain_features.py
+
+Purpose:
+Extract sender/domain relationship and brand-lookalike indicators.
+
+Features:
+
+- normalized_domain:
+  Cleaned domain from domain or sender_email.
+
+- punycode_detection:
+  Flags xn-- domains.
+
+- subdomain_depth:
+  Measures how many subdomain labels exist beyond registered-domain-like parts.
+
+- levenshtein_distance_to_brand:
+  Normalized edit distance from domain label to known brand aliases.
+
+- display_name_mismatch:
+  Flags when display name or subject mentions a known brand but the sender domain is not verified for that brand.
+
+- domain_registry_mismatch:
+  Flags likely brand lookalike outside verified registry.
+
+- likely_brand:
+  Best inferred brand for analytics and explanation.
+
+Threat signals captured:
+
+- Brand impersonation
+- Lookalike domains
+- Excessive subdomain abuse
+- Punycode abuse
+- Display-name deception
+
+Why this is separate from link features:
+Sender identity and link destinations are related but distinct. A message can come from a spoofed sender domain and contain no links. A message can come from a benign sender and include a suspicious link. Separating them preserves signal clarity.
+
+
+5.5 structural_features.py
+
+Purpose:
+Extract HTML structure indicators.
+
+Features:
+
+- html_to_text_ratio:
+  Measures how much HTML wrapper exists compared with visible text.
+
+- form_tag_presence:
+  Flags embedded form tags.
+
+- hidden_element_count:
+  Counts hidden elements, hidden inputs, aria-hidden elements, and display/visibility hidden styles.
+
+Threat signals captured:
+
+- Credential harvesting forms
+- Hidden fields
+- Obfuscated or layout-heavy HTML
+
+Tradeoff:
+The extension currently sends html as null to protect privacy, so these features are most useful for direct API submissions, test fixtures, or future opt-in enterprise modes.
+
+
+5.6 Alternative approaches considered
+
+Alternative: Pure ML on raw email body
+
+Rejected as the only approach because it is less explainable, requires more training data, and misses explicit URL/domain logic.
+
+Alternative: Pure rules
+
+Rejected as the only approach because rules are brittle and produce poor generalization. Attackers can avoid known phrases.
+
+Alternative: External threat intelligence only
+
+Rejected as the only approach because zero-day phishing domains and newly registered lookalikes may not be present in feeds.
+
+Alternative: Browser-only detection
+
+Rejected as the only approach because browser extensions have limited ML runtime, harder model update paths, and less centralized analytics.
+
+
+5.7 Limitations of structured feature extraction
+
+- It depends on curated phrase lists and known brand registries.
+- It may under-detect novel social engineering language.
+- It can be fooled by image-only phishing messages.
+- It does not perform OCR.
+- Domain parsing uses simple heuristics rather than a full public suffix list.
+- HTML features are limited when HTML is not provided.
+- URL entropy can produce false positives for legitimate tracking links.
+
+
+------------------------------------------------------------------
+6. MACHINE LEARNING DESIGN
+------------------------------------------------------------------
+
+6.1 Why TF-IDF + Logistic Regression baseline
+
+The baseline uses:
+
+- TfidfVectorizer for body_text
+- StandardScaler for numeric structured features
+- LogisticRegression classifier
+- scikit-learn Pipeline and ColumnTransformer
+- joblib for persistence
+
+This was chosen because:
+
+- It is easy to train quickly.
+- It is interpretable compared with deep learning.
+- It works with small and medium datasets.
+- It has low inference latency.
+- It can run inside the same FastAPI process.
+- It is easy to test in CI.
+- It provides predict_proba for scoring fusion.
+
+For a portfolio project, a simple baseline is often better than a poorly trained deep model. It demonstrates the pipeline correctly before increasing complexity.
+
+
+6.2 Why not deep learning immediately
+
+Deep learning was not chosen as the first implementation because:
+
+- It requires more data to avoid overfitting.
+- It adds heavy dependencies.
+- It increases deployment complexity.
+- It increases inference cost and latency.
+- It is harder to explain to a user or analyst.
+- It can distract from the security architecture.
+
+Deep learning is useful later, especially for semantic understanding of phishing language. But the initial platform should first prove:
+
+- request flow
+- feature extraction
+- privacy controls
+- scoring fusion
+- logging
+- admin analytics
+- tests
+
+
+6.3 How numeric structured features integrate with vectorized text
+
+The training script builds a row with:
+
+- body_text
+- numeric feature columns
+- label
+
+The model pipeline uses ColumnTransformer:
+
+- "tfidf" transformer on body_text
+- "numeric" transformer on structured numeric columns
+
+The outputs are combined into one feature matrix, then passed to LogisticRegression.
+
+This allows the model to learn from both:
+
+- word and phrase distribution
+- explicit security indicators
+
+Example:
+A phishing message may not contain a known phrase but may have anchor mismatch and punycode. Numeric features preserve those signals.
+
+
+6.4 Model training process
+
+File:
+app/services/ml_engine/train.py
+
+Training flow:
+
+1. Load CSV with pandas.
+2. Detect a text column and label column.
+3. Normalize label values into 0 or 1.
+4. Extract URLs from text.
+5. Build a normalized payload for each row.
+6. Run the same extract_features pipeline used during inference.
+7. Construct a training DataFrame.
+8. Split into train/test.
+9. Build ColumnTransformer and LogisticRegression pipeline.
+10. Fit the pipeline.
+11. Compute classification report and ROC AUC when possible.
+12. Save artifact with joblib.
+
+The same feature extraction path is used for training and inference. This reduces training-serving skew.
+
+
+6.5 Inference fallback mechanism
+
+File:
+app/services/ml_engine/inference.py
+
+If the configured model file does not exist, is empty, or cannot be loaded, PhishingModel uses a deterministic fallback probability.
+
+The fallback uses features such as:
+
+- urgency_keyword_count
+- credential_phrase_count
+- anchor_mismatch_flag
+- ip_based_url_flag
+- suspicious_tld_score
+- punycode_detection
+- display_name_mismatch
+- domain_registry_mismatch
+- hidden_element_count
+
+Why fallback exists:
+
+- The API remains functional before a model is trained.
+- Tests and demos can run without a real dataset.
+- The system fails gracefully rather than crashing on missing model artifact.
+
+Tradeoff:
+Fallback scoring is hand-tuned and not learned from data. It should not be treated as production-grade ML.
+
+
+6.6 Model loading strategy
+
+File:
+app/services/ml_engine/model_loader.py
+
+get_model() is decorated with lru_cache. This means the PhishingModel is loaded once per process and reused.
+
+Why:
+
+- Avoid loading joblib artifact for every request.
+- Keep API latency lower.
+- Keep model access centralized.
+
+Tradeoff:
+If the model file changes on disk, the process must restart or the cache must be cleared to load the new model. A production system could implement versioned model loading or a model registry.
+
+
+6.7 Limitations of current ML approach
+
+- TF-IDF does not understand semantics deeply.
+- Logistic Regression is linear.
+- Model quality depends heavily on dataset quality.
+- Training data may not match live phishing campaigns.
+- Feature extraction may mask some useful signal for privacy.
+- URL/domain parsing is simplified.
+- The current placeholder model is not trained.
+- The fallback scorer is deterministic and approximate.
+
+
+6.8 Upgrade path to transformer models
+
+Potential DistilBERT path:
+
+1. Keep structured feature extraction.
+2. Add a text embedding/model service for subject and body_text.
+3. Combine transformer probability with structured features or with the existing scoring engine.
+4. Use calibration to align model probability with risk scoring.
+5. Add tests for model version and inference output shape.
+
+Potential ONNX path:
+
+1. Fine-tune or select a transformer model.
+2. Export to ONNX.
+3. Use ONNX Runtime for inference.
+4. Wrap ONNX inference behind the same PhishingModel interface.
+5. Keep model_loader as the only import path for the inference model.
+
+Important:
+The scoring engine should not care whether ml_probability came from Logistic Regression, DistilBERT, or ONNX. This is why ML is abstracted behind get_model().predict_probability(features).
+
+
+6.9 Tradeoffs between traditional ML and transformer models
+
+Traditional ML:
+
+Pros:
+- Fast.
+- Cheap.
+- Easier to inspect.
+- Works with smaller datasets.
+- Simple deployment.
+- Good for baseline portfolio systems.
+
+Cons:
+- Less semantic understanding.
+- Weaker against paraphrased phishing.
+- Requires manual feature engineering.
+
+Transformer:
+
+Pros:
+- Better semantic understanding.
+- Better at paraphrased language.
+- Can capture context and intent.
+
+Cons:
+- Heavier.
+- More expensive.
+- Harder to explain.
+- Needs careful dataset curation.
+- Adds serving complexity.
+- May require GPU or optimized runtime.
+
+The current project correctly starts with traditional ML and leaves a clean upgrade path.
+
+
+------------------------------------------------------------------
+7. IMPERSONATION DETECTION ENGINE
+------------------------------------------------------------------
+
+7.1 Levenshtein distance explanation
+
+Levenshtein distance measures the minimum number of single-character edits needed to change one string into another. Edits include:
+
+- insertion
+- deletion
+- substitution
+
+Example:
+paypa1 to paypal has distance 1 because "1" can be substituted with "l".
+
+PhishGuard uses normalized distance between the compact domain label and known brand aliases. A small normalized distance indicates the domain may be a lookalike.
+
+Why this matters:
+Phishing domains often use small changes:
+
+- paypa1.com
+- rnicrosoft.com
+- gooogle-login.com
+- arnazon-support.com
+
+Levenshtein distance is not perfect, but it is simple, explainable, and effective for many lookalike cases.
+
+
+7.2 Punycode detection
+
+Punycode domains begin with xn--. They encode internationalized domain names using ASCII. Punycode is legitimate for international domains, but attackers can use it to create visually deceptive domains.
+
+Example concept:
+A domain may visually resemble apple.com while using non-Latin characters encoded through punycode.
+
+PhishGuard flags:
+
+- xn-- in domain_features.py
+- homoglyph characters in impersonation_detector.py
+
+This captures both encoded and direct Unicode deception signals.
+
+
+7.3 Subdomain abuse detection
+
+Subdomain depth measures how many labels exist before the registered-domain-like portion.
+
+Example:
+login.security.paypal.com has subdomain depth 2 relative to paypal.com.
+
+Phishing attacks often use long subdomains to place brand terms before the real registrable domain:
+
+paypal.com.security-update.attacker.example
+
+To a rushed user, the leftmost terms may appear trustworthy. Subdomain depth is therefore a useful risk signal.
+
+The current project computes depth simply by counting domain labels beyond the last two. A production version should use the public suffix list because domains such as example.co.uk require more accurate parsing.
+
+
+7.4 Brand registry logic
+
+Files:
+app/intelligence/brand_registry.py
+app/intelligence/verified_domains.py
+
+The registry maps brand names to verified domains.
+
+Example:
+PayPal -> paypal.com, paypalobjects.com
+Microsoft -> microsoft.com, office.com, outlook.com, live.com
+
+The logic supports:
+
+- brand aliases
+- finding brand mentions in display name, subject, or text
+- checking whether a domain belongs to a verified brand
+- inferring a likely brand for analytics
+
+Brand registry logic is intentionally explicit because brand impersonation is often better detected with deterministic knowledge than with general text classification alone.
+
+
+7.5 Why impersonation detection was separated from ML
+
+Reasons:
+
+- Explainability:
+  Analysts need to know that a brand was mentioned from an unverified domain.
+
+- Determinism:
+  Verified domain matching should not depend on model weights.
+
+- Updatability:
+  Brand registries change more often than trained models. A new verified domain can be added without retraining.
+
+- Safety:
+  ML may underweight rare but critical brand abuse. Rules can force explicit signal.
+
+- Testing:
+  Impersonation rules can be unit-tested directly.
+
+ML can learn impersonation patterns, but it should not be the only mechanism.
+
+
+7.6 Pros and cons of rule-based detection vs ML-only detection
+
+Rule-based detection:
+
+Pros:
+- Explainable.
+- Easy to update.
+- Good for known brands and known patterns.
+- Strong for deterministic mismatches.
+- Testable with small examples.
+
+Cons:
+- Can miss novel brands.
+- Requires maintenance.
+- Can produce false positives for legitimate third-party services.
+- Attackers can avoid known terms.
+
+ML-only detection:
+
+Pros:
+- Can generalize from data.
+- Can detect less obvious patterns.
+- Can combine many weak signals.
+
+Cons:
+- Less explainable.
+- Dataset-dependent.
+- Harder to update quickly for verified-domain changes.
+- May produce confident wrong answers.
+
+PhishGuard uses both.
+
+
+------------------------------------------------------------------
+8. SCORING ENGINE
+------------------------------------------------------------------
+
+8.1 Weighted scoring formula explanation
+
+File:
+app/services/scoring_engine.py
+
+Formula:
+
+final_score =
+0.30 * ml_probability +
+0.25 * impersonation_score +
+0.20 * heuristic_score +
+0.15 * link_reputation +
+0.10 * domain_registry_mismatch
+
+Weights:
+
+- ML probability, 30%:
+  The ML model captures learned patterns from text and structured features.
+
+- Impersonation score, 25%:
+  Brand impersonation is a high-value phishing signal and should strongly influence the result.
+
+- Client heuristic score, 20%:
+  Local observations matter but should not dominate server-side analysis.
+
+- Link reputation, 15%:
+  URL indicators are important but may be absent in some phishing messages.
+
+- Domain registry mismatch, 10%:
+  Kept as a direct signal even though it also contributes to impersonation. This preserves explicit pressure from domain-brand mismatch.
+
+The final score is clamped between 0 and 1 and rounded to four decimals.
+
+
+8.2 Why weight-based fusion instead of pure ML output
+
+Pure ML output was not used as the final result because:
+
+- Early-stage ML may not be well calibrated.
+- Rule-based security signals are easier to explain.
+- Some signals are operational rather than textual.
+- Threat intelligence updates should affect scoring without retraining.
+- A single model score hides why a message was flagged.
+
+Weight-based fusion lets the system combine independent evidence sources. This is common in detection engineering: a final alert score often blends model, rules, reputation, and context.
+
+
+8.3 How explainability is achieved
+
+Explainability comes from reasons.
+
+Reasons are collected from:
+
+- client heuristics
+- impersonation detector
+- reputation service
+- ML high-probability threshold
+- credential phrase detection
+- anchor mismatch detection
+
+The scoring engine de-duplicates and sorts reasons.
+
+The response includes:
+
+- risk_score
+- classification
+- confidence
+- reasons
+- model_version
+- sample_hash
+- impersonated_brand
+- components
+
+The components map shows the contribution sources. This is important because an analyst can see whether the result was driven by ML, impersonation, link reputation, or client heuristics.
+
+
+8.4 Confidence calculation logic
+
+Confidence is not model confidence. It is score-position confidence.
+
+Logic:
+
+- high confidence if risk_score >= 0.78 or risk_score <= 0.15
+- medium confidence if risk_score >= 0.52 or risk_score <= 0.26
+- otherwise low
+
+Rationale:
+Scores near the extremes are more decisive. Scores near the decision boundaries are less certain. This is a practical confidence heuristic for a multi-signal score.
+
+Classification thresholds:
+
+- phishing if risk_score >= 0.72
+- suspicious if risk_score >= 0.38
+- safe otherwise
+
+These thresholds are deliberately conservative for phishing. A score must be fairly high to classify as phishing. Middle scores are suspicious because user-facing security tools should avoid overstating certainty.
+
+
+8.5 Tradeoffs
+
+Pros:
+
+- Transparent.
+- Easy to tune.
+- Works before ML is mature.
+- Supports multiple signal types.
+- Produces explainable output.
+
+Cons:
+
+- Weights are hand-selected.
+- Scores may not be statistically calibrated.
+- Some signals overlap.
+- Attackers may target known thresholds.
+- Requires validation against real datasets.
+
+Future improvement:
+Use validation data to calibrate weights, or train a meta-classifier over component scores while preserving explanations.
+
+
+------------------------------------------------------------------
+9. DASHBOARD (REACT + TAILWIND)
+------------------------------------------------------------------
+
+9.1 Why Vite
+
+Vite was chosen because:
+
+- It is fast for local development.
+- It has a simple React setup.
+- It avoids heavy boilerplate.
+- It is common in modern frontend projects.
+- It works well for a portfolio admin console.
+
+Alternatives:
+
+- Create React App:
+  Older and slower development experience.
+
+- Next.js:
+  Powerful but unnecessary for a local admin dashboard. Server-side rendering is not needed.
+
+- Plain HTML:
+  Simpler but less representative of modern dashboard development.
+
+
+9.2 Why Tailwind
+
+Tailwind was chosen because:
+
+- It enables fast UI composition.
+- It keeps styling local to components.
+- It avoids creating a custom CSS architecture for a scaffold.
+- It is widely used in modern frontend systems.
+
+Tradeoff:
+Tailwind class strings can become verbose. For a larger dashboard, shared components and design tokens would become more important.
+
+
+9.3 JWT handling
+
+The dashboard login page calls:
+
+POST /api/admin/login
+
+The returned access_token is stored in localStorage under phishguardAdminToken. API calls include:
+
+Authorization: Bearer <token>
+
+This is simple and practical for a local scaffold.
+
+Security caveat:
+localStorage is vulnerable to token theft if an XSS vulnerability exists in the dashboard. Production hardening should consider secure cookies, Content Security Policy, shorter token lifetimes, and SSO.
+
+
+9.4 Data fetching architecture
+
+File:
+dashboard/src/services/api.js
+
+This file centralizes:
+
+- API base URL
+- token get/set/clear
+- request helper
+- login
+- fetchSummary
+- fetchRecent
+- fetchTrends
+- fetchBrands
+- fetchSiemExport
+
+Dashboard components do not construct raw fetch calls. This keeps authentication and error handling in one place.
+
+The Dashboard page calls several endpoints in parallel:
+
+- /admin/summary
+- /admin/recent
+- /admin/trends
+- /admin/brands
+
+It refreshes every 30 seconds. This provides near-real-time portfolio behavior without websockets.
+
+
+9.5 Visualization strategy without heavy chart libraries
+
+The dashboard implements:
+
+- Risk distribution bars with div widths.
+- Trend line with inline SVG.
+- Tables for brands and recent events.
+- Preformatted JSON for SIEM export.
+
+Why avoid heavy chart libraries:
+
+- Lower dependency footprint.
+- Easier to inspect.
+- Enough for scaffold analytics.
+- Avoids charting configuration complexity.
+
+Tradeoff:
+Custom simple charts lack advanced accessibility, tooltips, zooming, legends, and responsive behavior found in mature charting libraries.
+
+
+9.6 Tradeoffs
+
+Pros:
+
+- Lightweight.
+- Easy to run locally.
+- Demonstrates admin flow.
+- JWT-protected API integration.
+- No unnecessary frontend complexity.
+
+Cons:
+
+- No routing.
+- No refresh token handling.
+- No advanced charting.
+- No user management.
+- No pagination beyond backend limits.
+
+
+------------------------------------------------------------------
+10. INFRASTRUCTURE
+------------------------------------------------------------------
+
+10.1 Docker setup explanation
+
+backend/Dockerfile uses:
+
+- python:3.12-slim
+- /app working directory
+- requirements.txt installation
+- app copied into image
+- uvicorn command
+
+This creates a reproducible backend runtime independent of the developer's local Python environment.
+
+Why python:3.12-slim:
+
+- Smaller than full Python images.
+- Modern Python syntax support.
+- Good enough for FastAPI and scikit-learn dependencies.
+
+Tradeoff:
+Slim images sometimes require additional system packages for heavier dependencies. Current requirements are expected to install through wheels in typical environments.
+
+
+10.2 docker-compose usage
+
+There are compose files for:
+
+- backend-only local service
+- infrastructure-level backend plus dashboard
+
+The infrastructure compose file runs:
+
+- backend service built from backend/
+- dashboard service using node:20-alpine
+
+The dashboard command installs dependencies and runs Vite. This is convenient for local demos but not ideal for production. Production should build static assets once and serve them through nginx or another static server.
+
+
+10.3 nginx config purpose
+
+infrastructure/nginx/phishguard.conf provides an example reverse proxy configuration.
+
+It adds security headers:
+
+- X-Content-Type-Options: nosniff
+- X-Frame-Options: DENY
+- Referrer-Policy: no-referrer
+- Content-Security-Policy
+
+It proxies /api/ to the backend and serves static frontend files for other paths.
+
+Purpose:
+Show how the backend and dashboard could be placed behind one origin. This simplifies CORS and mirrors common production deployment.
+
+
+10.4 Environment variable strategy
+
+Backend settings are read through pydantic-settings with PHISHGUARD_ prefix.
+
+Examples:
+
+- PHISHGUARD_ENVIRONMENT
+- PHISHGUARD_DATABASE_URL
+- PHISHGUARD_JWT_SECRET
+- PHISHGUARD_ADMIN_USERNAME
+- PHISHGUARD_ADMIN_PASSWORD
+- PHISHGUARD_CORS_ORIGINS
+- PHISHGUARD_RATE_LIMIT_PER_MINUTE
+
+Why environment variables:
+
+- Standard twelve-factor app pattern.
+- Keeps secrets out of source code.
+- Makes Docker configuration straightforward.
+- Supports deployment-specific values.
+
+The .env.example file documents required settings without storing real secrets.
+
+
+10.5 Why this deployment approach was chosen
+
+The project uses simple local infrastructure because the goal is architectural clarity. It demonstrates:
+
+- containerized backend
+- local dashboard
+- persisted database volume
+- environment configuration
+- reverse proxy security headers
+
+It does not introduce Kubernetes, Terraform, managed databases, Redis, or cloud IAM because those would add a lot of operational scaffolding before the detection system itself is understood.
+
+
+------------------------------------------------------------------
+11. SECURITY ARCHITECTURE
+------------------------------------------------------------------
+
+11.1 Zero Trust principles applied
+
+PhishGuard applies Zero Trust thinking in several places:
+
+- Do not trust the web page DOM.
+  Extracted values are treated as untrusted.
+
+- Do not trust the extension.
+  Backend validates and masks again.
+
+- Do not trust input size.
+  Pydantic length limits constrain payloads.
+
+- Do not trust admin routes.
+  JWT is required for analytics and SIEM export.
+
+- Do not trust stored data access.
+  Raw email content is not stored.
+
+- Do not trust one detection signal.
+  ML, rules, heuristics, reputation, and registry checks are fused.
+
+
+11.2 Input validation boundaries
+
+Validation occurs at:
+
+- Browser extraction:
+  Extractors normalize fields.
+
+- Extension masking:
+  Payload is clamped and masked.
+
+- Backend Pydantic models:
+  Types, allowed values, and max lengths are enforced.
+
+- Feature extraction:
+  Values are normalized before domain and link logic.
+
+- Persistence:
+  Only selected fields are stored.
+
+This layered validation approach is important because any one layer may fail or be bypassed.
+
+
+11.3 Identity enforcement
+
+Identity enforcement exists for administrative operations:
+
+- login validates admin username/password
+- create_access_token signs JWT
+- require_admin decodes JWT, validates scope, and requires subject
+- dashboard sends bearer token
+- SIEM export requires admin token
+
+Analysis endpoint is intentionally unauthenticated in the scaffold because browser extensions may not have a user login flow. In production, the analyze endpoint could require an extension API key, device token, organization token, or user auth.
+
+
+11.4 Data minimization strategy
+
+Data minimization choices:
+
+- Sender local-part masked by extension.
+- Text PII masked by extension.
+- Backend masks again.
+- Raw body not persisted.
+- Raw HTML not persisted.
+- Stored features exclude body_text.
+- Sender and subject stored as HMAC hashes.
+- Sample stored as SHA-256 hash.
+- SIEM export uses hashed identifiers.
+
+Why:
+Phishing detection needs enough signal to be useful, but email content is highly sensitive. The project keeps analytic value while reducing breach impact.
+
+
+11.5 Threat assumptions
+
+Assumptions:
+
+- Attackers can control email content.
+- Attackers can control links and anchor text.
+- Attackers can spoof display names.
+- Attackers may use lookalike domains.
+- Attackers may call the backend directly.
+- Admins need visibility but should not see raw user email content.
+- Model predictions are fallible.
+- Threat intelligence is incomplete.
+
+
+11.6 Known risks
+
+Known risks:
+
+- Broad extension host permissions.
+- DOM selector fragility.
+- In-memory rate limiting.
+- Single admin account.
+- Dashboard token in localStorage.
+- No database encryption layer in scaffold.
+- No public suffix list for domain parsing.
+- No external reputation feed ingestion yet.
+- No OCR for image-based phishing.
+- No attachment analysis.
+- No sandboxed URL detonation.
+
+
+------------------------------------------------------------------
+12. TESTING STRATEGY
+------------------------------------------------------------------
+
+12.1 Unit tests
+
+Unit tests cover core logic that should remain stable:
+
+- feature extraction flags
+- spoof domain detection
+- Levenshtein behavior
+- scoring thresholds
+
+These are good unit test targets because they are deterministic. They do not require network access or a browser.
+
+
+12.2 ML validation tests
+
+test_ml_training.py creates a small temporary CSV and verifies that train_model writes a model artifact and reports row count.
+
+This test is not meant to prove model quality. It proves that:
+
+- training code can load data
+- labels can be normalized
+- feature extraction works in training path
+- pipeline can fit
+- artifact can be written
+
+Model quality requires larger datasets, validation splits, ROC/PR analysis, calibration, and adversarial testing.
+
+
+12.3 API tests
+
+test_api.py verifies:
+
+- /health returns ok
+- /api/analyze returns a structured assessment for a phishing-like payload
+
+API tests are important because they validate integration between:
+
+- Pydantic models
+- feature extraction
+- model fallback
+- impersonation detection
+- reputation
+- scoring
+- repository/database startup
+
+
+12.4 Extension tests
+
+tests/extension/test_manifest.py checks:
+
+- manifest_version is 3
+- storage permission is present
+- sensitive permissions such as tabs, history, and cookies are absent
+- CSP includes object-src 'none'
+- privacy utilities load before injector
+- localScorer loads before injector
+
+These are static tests, but they catch common extension security mistakes.
+
+A future browser simulation test could use Playwright with a fixture page to validate DOM extraction and banner injection.
+
+
+12.5 Why test structure was designed that way
+
+The tests follow risk boundaries:
+
+- Feature extraction:
+  High security signal value. Must be deterministic.
+
+- Spoof detection:
+  Easy to regress when registry logic changes.
+
+- Scoring:
+  Threshold changes affect user-facing classification.
+
+- API:
+  Ensures the full backend path returns contract-compatible output.
+
+- ML training:
+  Ensures the pipeline remains runnable.
+
+- Extension manifest:
+  Prevents permission creep and load-order breakage.
+
+This is more valuable than only testing happy-path UI rendering.
+
+
+------------------------------------------------------------------
+13. LIMITATIONS
+------------------------------------------------------------------
+
+13.1 Known weaknesses
+
+- The default model artifact is a placeholder.
+- Fallback model is heuristic and hand-tuned.
+- Brand registry is small.
+- Suspicious TLD list is static.
+- Domain parsing does not use the public suffix list.
+- Webmail DOM selectors may break.
+- Generic extractor may classify non-email pages as email-like.
+- No attachment scanning.
+- No OCR for image-based phishing.
+- No QR-code phishing detection.
+- No URL detonation sandbox.
+- No external reputation API integration.
+- No tenant separation.
+- No admin audit log.
+- No real user identity provider integration.
+
+
+13.2 Edge cases
+
+- Legitimate third-party notification services may send branded emails from non-brand domains.
+- Marketing emails often use tracking links with high entropy and redirect domains.
+- Legitimate internationalized domains may use punycode.
+- Legitimate security alerts use urgent language.
+- Password reset emails can look like credential phishing.
+- Some phishing messages contain only images.
+- Some webmail views virtualize DOM nodes, making extraction incomplete.
+- Some links are rewritten by enterprise email security tools.
+
+
+13.3 Dataset bias risks
+
+Training datasets may be biased by:
+
+- old phishing campaigns
+- specific languages
+- specific brands
+- email sources with labeling errors
+- URL-only datasets used as email proxies
+- spam datasets that are not phishing-specific
+- benign corporate email unavailable in public datasets
+
+If the model is trained on biased data, it may:
+
+- over-detect old patterns
+- under-detect modern attacks
+- overfit to dataset artifacts
+- perform poorly on non-English emails
+- misclassify legitimate security notifications
+
+
+13.4 False positive and false negative tradeoffs
+
+False positives:
+
+- Annoy users.
+- Reduce trust in the extension.
+- Can cause alert fatigue.
+- May interrupt legitimate work.
+
+False negatives:
+
+- Allow phishing messages through.
+- Create a false sense of safety.
+- Increase risk of credential theft or fraud.
+
+The scoring thresholds place a middle category, suspicious, between safe and phishing. This is a deliberate tradeoff. The system can warn without always asserting high-confidence phishing.
+
+
+------------------------------------------------------------------
+14. FUTURE IMPROVEMENTS
+------------------------------------------------------------------
+
+14.1 Transformer integration
+
+Add DistilBERT or another compact transformer for semantic phishing language detection.
+
+Recommended approach:
+
+- Keep the current feature pipeline.
+- Add transformer inference behind PhishingModel.
+- Calibrate model output.
+- Preserve explanation reasons from rules and structured features.
+- Consider ONNX Runtime for deployment.
+
+
+14.2 Real-time threat feed ingestion
+
+Add ingestion jobs for:
+
+- PhishTank
+- OpenPhish
+- internal blocklists
+- brand abuse feeds
+- newly registered domain feeds
+
+Design requirements:
+
+- normalize indicators
+- store source
+- store first_seen and last_seen
+- store confidence
+- expire old indicators
+- avoid storing raw customer email
+
+
+14.3 Multi-tenant support
+
+Add:
+
+- organization table
+- tenant_id on events
+- tenant-scoped JWT claims
+- per-tenant admin roles
+- per-tenant brand allowlists
+- per-tenant SIEM export
+- per-tenant retention policy
+
+Important:
+Multi-tenancy must be introduced at the database and auth layers together. Adding tenant_id only to UI filters is not sufficient.
+
+
+14.4 Adaptive learning loop
+
+Add analyst feedback:
+
+- mark event as true positive
+- mark event as false positive
+- mark event as false negative
+- export labeled samples without raw content where possible
+- retrain periodically
+- monitor drift
+
+Privacy challenge:
+Feedback loops often want raw examples. PhishGuard should design opt-in redaction and retention policies before collecting raw training data.
+
+
+14.5 Enterprise features
+
+Potential enterprise upgrades:
+
+- SSO/OIDC login
+- RBAC
+- audit logging
+- PostgreSQL
+- Redis rate limiting
+- queue-based analysis workers
+- URL reputation integrations
+- SOAR webhook
+- Splunk/Elastic/Sentinel connectors
+- managed extension policy support
+- organization-specific brand registry
+- attachment metadata scanning
+- QR code detection
+- OCR for image lures
+- model registry and staged rollout
+
+
+------------------------------------------------------------------
+15. LINE-BY-LINE STRATEGIC RATIONALE
+------------------------------------------------------------------
+
+This section explains the key files by walking through their major lines and blocks. The goal is not to repeat syntax, but to explain why each block exists and why the logic belongs there.
+
+
+15.1 analyze.py
+
+File:
+backend/app/api/analyze.py
+
+Line group: future annotations import
+
+from __future__ import annotations
+
+This keeps modern type annotations from being evaluated too early at runtime. It improves compatibility across Python environments and prevents annotation syntax from causing runtime import errors.
+
+Line group: imports
+
+The file imports FastAPI router/dependency primitives, Pydantic models, SQLAlchemy Session, security helpers, repository, feature extraction, impersonation detector, ML loader, reputation service, and scoring engine.
+
+Strategic reason:
+The analyze route is the orchestration boundary. It does not implement every algorithm itself, but it coordinates them. Imports reflect that role.
+
+Line group: router = APIRouter(prefix="/analyze", tags=["analysis"])
+
+This places all analysis routes under /api/analyze once mounted by main.py. The tag helps OpenAPI documentation.
+
+Strategic reason:
+Analysis is separate from admin and SIEM. Keeping route ownership clear prevents privilege and responsibility confusion.
+
+Line group: EmailLink model
+
+EmailLink validates href and anchor_text length.
+
+Strategic reason:
+Links are attacker-controlled input. Href length is capped at 2048 to avoid oversized URL payloads. Anchor text is capped because it may be displayed later as part of reasons or feature context.
+
+Line group: AnalyzeRequest model
+
+This model defines the complete normalized analysis contract.
+
+Strategic reason:
+The backend should not care whether the input came from Gmail, Outlook, generic extraction, or direct API. It should receive one stable shape.
+
+Field: sender_email
+
+Max length 320 matches practical email address constraints.
+
+Field: display_name
+
+Display names are useful for impersonation detection but can contain PII. Length is limited.
+
+Field: subject
+
+Subject is useful for text and brand detection. Length is limited to avoid abuse.
+
+Field: body_text
+
+Body text is necessary for ML and phrase detection. It is limited to 50000 characters to prevent unbounded processing.
+
+Field: html
+
+HTML is optional and capped. Structural features can use it, but the extension currently sends null by default for privacy.
+
+Field: links
+
+Limited to 200 links. This prevents an attacker from sending a massive link array to increase CPU and storage load.
+
+Field: heuristic_score
+
+Constrained to 0..1 because it directly contributes to weighted scoring.
+
+Field: client_reasons
+
+Limited and clamped because reasons can be displayed and stored.
+
+Field: source
+
+Literal allowed values prevent arbitrary source strings from polluting analytics.
+
+Line group: clamp_reasons validator
+
+The validator converts reasons to strings, truncates each to 240 characters, and keeps at most 25.
+
+Strategic reason:
+Even validated arrays need content-level limits. This prevents huge reason strings from becoming log or database abuse.
+
+Line group: AnalyzeResponse model
+
+Defines output contract:
+
+- risk_score
+- classification
+- confidence
+- reasons
+- model_version
+- sample_hash
+- impersonated_brand
+- components
+
+Strategic reason:
+The extension and dashboard need a stable response shape. Including components supports transparency and debugging.
+
+Line group: analyze_email route
+
+This route is the main pipeline.
+
+raw_payload = payload.model_dump()
+
+The Pydantic object is converted into a plain dictionary because downstream feature extraction and services operate on dictionaries.
+
+sample_hash = canonical_hash(...)
+
+The sample hash is created from selected raw fields before masking. It is used for anonymized correlation. The system does not store the raw fields.
+
+masked_payload = mask_payload(raw_payload)
+
+The backend masks again even if the client already did. This enforces privacy server-side.
+
+features = extract_features(masked_payload)
+
+Feature extraction happens on masked data. This produces structured evidence for ML, impersonation, and scoring.
+
+model = get_model()
+
+The model is loaded through the cached model loader. The route does not know whether the model is a real joblib artifact or fallback.
+
+ml_probability = model.predict_probability(features)
+
+The route asks for a probability, not a class. This keeps the final decision in the scoring engine.
+
+impersonation = ImpersonationDetector().evaluate(...)
+
+Brand impersonation is separate from ML. The route coordinates it as another signal.
+
+reputation = ReputationService().evaluate_links(...)
+
+Link reputation is another independent signal.
+
+domain_registry_mismatch = ...
+
+The direct mismatch feature is extracted for scoring. It remains visible as a separate component.
+
+heuristic_score = ...
+
+The extension's local score is included but bounded by validation.
+
+reasons = [...]
+
+Reasons are aggregated from client, impersonation, and reputation sources.
+
+if ml_probability >= 0.7:
+
+Adds a reason when the ML baseline is strongly suspicious. This converts a numeric model output into an explainable statement.
+
+if credential_phrase_count > 0:
+
+Adds explicit reason for credential harvesting language.
+
+if anchor_mismatch_flag > 0:
+
+Adds explicit reason for link deception.
+
+result = ScoringEngine().score(...)
+
+All signals are fused in one scoring service. The route does not hard-code final thresholds.
+
+EventRepository(db).create_event(...)
+
+Stores anonymized analysis metadata. This is after scoring because the database event should contain final classification.
+
+sender_hash = hmac_hash(...)
+subject_hash = hmac_hash(...)
+
+HMAC supports privacy-preserving correlation without storing raw values.
+
+features = {key: value for key, value in features.items() if key not in {"body_text"}}
+
+body_text is excluded from stored features. This prevents raw or masked text from becoming persistent data.
+
+return {...}
+
+The route returns final result, model version, sample hash, impersonated brand, and component scores.
+
+Why logic is placed here:
+analyze.py is the composition layer for one HTTP request. It owns sequence, not implementation details. Algorithms live in services. Persistence lives in repository. This keeps the route readable and testable.
+
+
+15.2 scoring_engine.py
+
+File:
+backend/app/services/scoring_engine.py
+
+Line group: class ScoringEngine
+
+The scoring engine is a service class rather than free-floating code.
+
+Strategic reason:
+It can later hold configuration, calibrated thresholds, tenant-specific weights, or versioned scoring policies.
+
+Line group: score method signature
+
+All inputs are keyword-only:
+
+- ml_probability
+- impersonation_score
+- heuristic_score
+- link_reputation
+- domain_registry_mismatch
+- reasons
+
+Strategic reason:
+Keyword-only arguments reduce mistakes. Passing five floats positionally is error-prone.
+
+Line group: weighted formula
+
+The formula combines independent signals with explicit weights.
+
+Strategic reason:
+This keeps scoring transparent. A reviewer can see exactly how risk is computed.
+
+Line group: clamp and round
+
+risk_score = round(min(max(risk_score, 0.0), 1.0), 4)
+
+Strategic reason:
+Scores should stay in the 0..1 range even if a component is misconfigured. Rounding keeps API output stable.
+
+Line group: classification thresholds
+
+>= 0.72 -> phishing
+>= 0.38 -> suspicious
+else safe
+
+Strategic reason:
+This creates a middle warning category. It avoids forcing all uncertain cases into safe or phishing.
+
+Line group: confidence logic
+
+Confidence is high near score extremes, medium outside intermediate ranges, and low near ambiguous middle values.
+
+Strategic reason:
+The confidence value describes decision decisiveness, not model certainty. That distinction matters.
+
+Line group: return reasons sorted(set(...))
+
+Reasons are de-duplicated and sorted.
+
+Strategic reason:
+Multiple detectors can produce similar reasons. The user should not see duplicate explanations.
+
+Why logic is placed here:
+Scoring is security policy. It should not be buried in the API route, ML model, or extension. Centralizing it makes future tuning safer.
+
+
+15.3 model_loader.py
+
+File:
+backend/app/services/ml_engine/model_loader.py
+
+Line group: imports
+
+The loader imports lru_cache, settings, and PhishingModel.
+
+Strategic reason:
+This file should know only how to obtain model configuration and instantiate the model wrapper.
+
+Line group: @lru_cache
+
+get_model is cached.
+
+Strategic reason:
+Loading a model from disk is expensive compared with request handling. Caching prevents repeated joblib loads.
+
+Line group: return PhishingModel(get_settings().model_path)
+
+The path comes from configuration, not hard-coded request logic.
+
+Strategic reason:
+Model path should be deploy-time configurable. The API should not know filesystem details.
+
+Why logic is placed here:
+The loader is a dependency boundary. Other code imports get_model, not joblib. This keeps future ONNX or transformer changes localized.
+
+
+15.4 impersonation_detector.py
+
+File:
+backend/app/services/impersonation_detector.py
+
+Line group: imports
+
+The detector imports brand registry helpers, spoofing intelligence, and normalize_domain.
+
+Strategic reason:
+Impersonation detection depends on intelligence and domain normalization, not on HTTP or database code.
+
+Line group: contains_homoglyph
+
+Checks whether any known homoglyph hint appears in the domain.
+
+Strategic reason:
+Homoglyph detection is a simple reusable primitive and should be isolated for testing.
+
+Line group: class ImpersonationDetector
+
+Encapsulates brand impersonation scoring.
+
+Strategic reason:
+This detector can later hold configuration, tenant-specific registries, or extra detection methods.
+
+Line group: domain = normalize_domain(...)
+
+The detector starts by normalizing domain input.
+
+Strategic reason:
+Detection should not compare raw, inconsistent strings.
+
+Line group: verified_brand = brand_for_verified_domain(domain)
+
+Checks whether the domain already belongs to a known verified brand.
+
+Strategic reason:
+If the domain is verified, brand mention is less suspicious.
+
+Line group: mentioned_brands = find_brand_mentions(...)
+
+The detector looks across display name, subject, first 500 body characters, and domain.
+
+Strategic reason:
+Attackers can place brand identity in different parts of the message. Limiting body text to 500 characters keeps the check bounded.
+
+Line group: likely_brand
+
+Uses feature-derived likely brand or first mentioned brand.
+
+Strategic reason:
+The detector returns a brand name for dashboard analytics even when exact verification fails.
+
+Line group: if mentioned_brands and not verified_brand
+
+Adds score and reason when a brand is mentioned from an unverified domain.
+
+Strategic reason:
+This is one of the strongest phishing indicators.
+
+Line group: if display_name_mismatch
+
+Adds score and reason for mismatch between display identity and domain.
+
+Strategic reason:
+Display-name spoofing is common and should be explicit.
+
+Line group: if domain_registry_mismatch
+
+Adds score and reason for brand-like domain outside registry.
+
+Strategic reason:
+Lookalike domain detection should influence impersonation even if the brand is not directly mentioned.
+
+Line group: if contains_homoglyph(domain)
+
+Adds homoglyph reason.
+
+Strategic reason:
+Unicode deception is a known impersonation tactic.
+
+Line group: if any(term in domain for term in SPOOFING_TERMS)
+
+Adds score for common spoofing words in domain.
+
+Strategic reason:
+Domains like secure-login-update-brand.example often combine trust words.
+
+Line group: if verified_brand
+
+Sets likely_brand to verified brand and reduces score.
+
+Strategic reason:
+Verified domains should reduce impersonation suspicion, but not necessarily erase every other risk.
+
+Line group: return
+
+Returns score, brand, reasons.
+
+Strategic reason:
+The scoring engine needs a numeric component, while the dashboard and response need brand and explanation.
+
+Why logic is placed here:
+Impersonation detection is neither pure ML nor pure feature extraction. It is a security service that consumes features and intelligence. Separating it makes the rule logic auditable.
+
+
+15.5 serviceWorker.js
+
+File:
+extension/src/background/serviceWorker.js
+
+Line group: importScripts("apiClient.js")
+
+Loads the API client into the service worker context.
+
+Strategic reason:
+MV3 service workers do not share normal module imports in the same way as bundled web apps. importScripts is the straightforward extension runtime pattern used here.
+
+Line group: const apiClient = new PhishGuardApiClient()
+
+Creates one client for the service worker.
+
+Strategic reason:
+The API client owns backend calls and cache access. The service worker should not duplicate that logic.
+
+Line group: chrome.runtime.onInstalled
+
+Sets default settings:
+
+- apiBaseUrl
+- suspiciousThreshold
+- cacheTtlMinutes
+
+Strategic reason:
+The extension works immediately after installation without requiring an options page.
+
+Line group: chrome.runtime.onMessage.addListener
+
+Receives messages from content scripts.
+
+Strategic reason:
+Content scripts are page-injected. The background service worker is the right place to mediate backend communication.
+
+Line group: message type check
+
+Only PHISHGUARD_ANALYZE messages are handled.
+
+Strategic reason:
+Message handlers should ignore unknown messages. This reduces accidental behavior.
+
+Line group: apiClient.analyze(...).then(...).catch(...)
+
+Calls backend flow and sends a structured response.
+
+Strategic reason:
+The content script gets one consistent success/error shape.
+
+Line group: return true
+
+Keeps the message channel open for asynchronous sendResponse.
+
+Strategic reason:
+Without return true, Chrome may close the response channel before the Promise resolves.
+
+Why logic is placed here:
+The service worker is the communication broker. It should not know DOM selectors or UI details.
+
+
+15.6 apiClient.js
+
+File:
+extension/src/background/apiClient.js
+
+Line group: class PhishGuardApiClient
+
+Encapsulates backend communication and cache operations.
+
+Strategic reason:
+Keeping fetch and storage code in one class makes serviceWorker.js simple and makes rate-limit/cache behavior easier to audit.
+
+Line group: constructor browser/chrome detection
+
+this.extensionApi = typeof browser !== "undefined" ? browser : chrome
+
+Strategic reason:
+Supports Firefox promise-style browser APIs and Chrome callback-style APIs.
+
+Line group: analyze(payload, cacheKey)
+
+Main method for backend analysis.
+
+Strategic reason:
+The caller should not need to know whether the result came from cache or network.
+
+Line group: getSettings()
+
+Reads apiBaseUrl, suspiciousThreshold, cacheTtlMinutes with defaults.
+
+Strategic reason:
+Settings can be overridden in storage without changing code.
+
+Line group: getCachedSafeResult
+
+Reads a cache entry by masked payload hash and validates TTL.
+
+Strategic reason:
+Only safe results are cached. Suspicious and phishing results should be re-evaluated because intelligence may change and warnings should remain fresh.
+
+Line group: fetch(...)
+
+Sends JSON to /analyze with:
+
+- Content-Type application/json
+- X-PhishGuard-Client extension-mv3
+- credentials omit
+- cache no-store
+
+Strategic reason:
+credentials omit prevents ambient cookies from being sent. cache no-store avoids browser HTTP caching of analysis requests.
+
+Line group: if response.status === 429
+
+Reads Retry-After and throws a structured error.
+
+Strategic reason:
+The extension can distinguish rate limiting from generic failure.
+
+Line group: if !response.ok
+
+Throws a failure for non-success backend responses.
+
+Strategic reason:
+Avoids rendering incomplete or invalid risk data.
+
+Line group: if result.classification === "safe"
+
+Caches only safe results.
+
+Strategic reason:
+Safe result caching reduces backend load while avoiding stale suppression of dangerous events.
+
+Line group: storageGet/storageSet/storageRemove
+
+Adapters for promise or callback APIs.
+
+Strategic reason:
+Cross-browser compatibility is localized. The rest of the client code can await storage operations.
+
+Why logic is placed here:
+The API client owns transport concerns. It should not know how a message was extracted or how a banner is rendered.
+
+
+15.7 riskBanner.js
+
+File:
+extension/src/ui/riskBanner.js
+
+Line group: IIFE
+
+The file is wrapped in an immediately invoked function expression.
+
+Strategic reason:
+Avoids leaking local variables into page/global scope while attaching only intended PhishGuard methods.
+
+Line group: BANNER_ID and STYLE_ID
+
+Constants identify injected elements.
+
+Strategic reason:
+The extension can update/remove its own UI without touching unrelated page elements.
+
+Line group: ensureStyle
+
+Injects CSS once.
+
+Strategic reason:
+Content scripts cannot rely on extension-page CSS. The banner needs self-contained styles.
+
+Line group: if document.getElementById(STYLE_ID)
+
+Avoids duplicate style tags.
+
+Strategic reason:
+DOM observer may trigger many renders. Duplicate styles would clutter the page.
+
+Line group: CSS template
+
+Defines fixed position, width, border, background, font, shadow, risk colors, and button styling.
+
+Strategic reason:
+The banner must be readable on arbitrary webmail pages. It uses explicit styles rather than inheriting host page styles.
+
+Line group: headline(result)
+
+Maps classification to user-facing phrase.
+
+Strategic reason:
+Classification codes should not be directly coupled to display text.
+
+Line group: render(result)
+
+Main rendering function.
+
+Strategic reason:
+All UI creation is centralized. The injector only passes result objects.
+
+Line group: remove existing banner
+
+Ensures only one current banner exists.
+
+Strategic reason:
+DOM changes can trigger repeated analyses. Multiple banners would be confusing.
+
+Line group: section with role=status and aria-live=polite
+
+Provides accessible status updates.
+
+Strategic reason:
+Security UI should not be purely visual.
+
+Line group: reasons slice(0, 4)
+
+Limits the number of displayed reasons.
+
+Strategic reason:
+Avoids overwhelming the user and keeps banner size stable.
+
+Line group: escapeHtml(reason)
+
+Escapes reason strings before inserting them into innerHTML.
+
+Strategic reason:
+Reasons can originate from client/server logic that may include derived user input. Escaping reduces injection risk.
+
+Line group: close button listener
+
+Allows user to dismiss the banner.
+
+Strategic reason:
+Injected security UI should not permanently block page interaction.
+
+Line group: document.documentElement.appendChild(banner)
+
+Appends to documentElement.
+
+Strategic reason:
+Keeps banner outside webmail application containers that may have overflow or layout constraints.
+
+Line group: badge.setPageBadge
+
+Stores classification as a dataset attribute.
+
+Strategic reason:
+Gives a simple integration point for tests or future styling.
+
+Line group: renderError
+
+Renders backend/extension failure as a neutral error state.
+
+Strategic reason:
+Failure should be visible. Silent failure would make users think no analysis occurred.
+
+Why logic is placed here:
+UI rendering is isolated from detection and networking. This reduces coupling and makes it easier to replace the banner with a popup or sidebar later.
+
+
+15.8 Architectural layering decisions
+
+Layering rule:
+Each module should own one kind of responsibility.
+
+Extension:
+
+- Extractors own provider-specific DOM knowledge.
+- Heuristics own local scoring.
+- Privacy utilities own masking and hashing.
+- Background client owns backend calls and cache.
+- UI modules own rendering.
+- Injector owns orchestration.
+
+Backend:
+
+- API routers own HTTP contracts.
+- Core owns configuration and security helpers.
+- Feature extraction owns deterministic signal generation.
+- ML engine owns model training/loading/inference.
+- Impersonation detector owns brand abuse logic.
+- Reputation service owns link reputation scoring.
+- Scoring engine owns final decision policy.
+- Repository owns persistence queries.
+- Intelligence modules own curated security knowledge.
+
+Why this matters:
+A phishing detection platform changes in many directions:
+
+- webmail DOM changes
+- brand registry updates
+- model upgrades
+- scoring threshold changes
+- dashboard analytics additions
+- database migrations
+- SIEM mapping changes
+- privacy policy changes
+
+If all code were coupled together, every change would be risky. The current structure reduces blast radius and makes the system upgrade-ready.
+
+
+END OF DOCUMENT
+

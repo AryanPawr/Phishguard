@@ -1,0 +1,30 @@
+{
+  "version": "2026.04",
+  "rules": [
+    {
+      "id": "PG-RULE-001",
+      "name": "Credential harvesting language",
+      "severity": "high",
+      "patterns": ["verify your account", "sign in to continue", "re-enter your password"]
+    },
+    {
+      "id": "PG-RULE-002",
+      "name": "Brand from unverified sender domain",
+      "severity": "high",
+      "patterns": ["display_name_mismatch", "domain_registry_mismatch"]
+    },
+    {
+      "id": "PG-RULE-003",
+      "name": "Link anchor mismatch",
+      "severity": "medium",
+      "patterns": ["anchor_mismatch_flag"]
+    },
+    {
+      "id": "PG-RULE-004",
+      "name": "Punycode or homoglyph domain",
+      "severity": "high",
+      "patterns": ["punycode_detection", "homoglyph"]
+    }
+  ]
+}
+

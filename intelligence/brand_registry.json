@@ -1,0 +1,21 @@
+{
+  "version": "2026.04",
+  "brands": [
+    { "name": "Apple", "domains": ["apple.com", "icloud.com"] },
+    { "name": "Amazon", "domains": ["amazon.com", "amazon.co.uk", "amazon.ca"] },
+    { "name": "Bank of America", "domains": ["bankofamerica.com", "bofa.com"] },
+    { "name": "Chase", "domains": ["chase.com", "jpmorgan.com"] },
+    { "name": "DHL", "domains": ["dhl.com"] },
+    { "name": "DocuSign", "domains": ["docusign.com", "docusign.net"] },
+    { "name": "Dropbox", "domains": ["dropbox.com"] },
+    { "name": "GitHub", "domains": ["github.com", "github.io"] },
+    { "name": "Google", "domains": ["google.com", "gmail.com", "accounts.google.com"] },
+    { "name": "Microsoft", "domains": ["microsoft.com", "office.com", "outlook.com", "live.com"] },
+    { "name": "Netflix", "domains": ["netflix.com"] },
+    { "name": "PayPal", "domains": ["paypal.com", "paypalobjects.com"] },
+    { "name": "Slack", "domains": ["slack.com"] },
+    { "name": "Stripe", "domains": ["stripe.com"] },
+    { "name": "UPS", "domains": ["ups.com"] }
+  ]
+}
+

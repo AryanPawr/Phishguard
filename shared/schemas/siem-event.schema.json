@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.phishguard.local/siem-event.schema.json",
+  "title": "PhishGuard SIEM Event",
+  "type": "object",
+  "required": [
+    "event.kind",
+    "event.category",
+    "event.type",
+    "event.module",
+    "event.created",
+    "phishguard.sample_hash",
+    "phishguard.risk_score",
+    "phishguard.classification"
+  ],
+  "properties": {
+    "event.kind": { "type": "string" },
+    "event.category": { "type": "array", "items": { "type": "string" } },
+    "event.type": { "type": "array", "items": { "type": "string" } },
+    "event.module": { "const": "phishguard" },
+    "event.created": { "type": "string", "format": "date-time" },
+    "threat.indicator.type": { "type": "string" },
+    "threat.indicator.confidence": { "type": "string" },
+    "phishguard.sample_hash": { "type": "string" },
+    "phishguard.sender_hash": { "type": "string" },
+    "phishguard.subject_hash": { "type": "string" },
+    "phishguard.domain": { "type": "string" },
+    "phishguard.risk_score": { "type": "number" },
+    "phishguard.classification": { "type": "string" },
+    "phishguard.impersonated_brand": { "type": ["string", "null"] },
+    "phishguard.reasons": { "type": "array", "items": { "type": "string" } }
+  }
+}
+

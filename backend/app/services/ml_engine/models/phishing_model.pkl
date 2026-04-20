@@ -1,0 +1,2 @@
+Placeholder model artifact. Run `python -m app.services.ml_engine.train --dataset <csv>` from `backend/` to replace this file with a joblib-trained TF-IDF + Logistic Regression model.
+
