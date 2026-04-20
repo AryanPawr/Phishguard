@@ -1,5 +1,23 @@
 (function initPopup() {
   const extensionApi = typeof browser !== "undefined" ? browser : chrome;
+  const CONTENT_SCRIPT_FILES = [
+    "src/utils/logger.js",
+    "src/utils/hash.js",
+    "src/utils/storage.js",
+    "src/heuristics/keywordEngine.js",
+    "src/heuristics/linkAnalyzer.js",
+    "src/heuristics/domainMismatch.js",
+    "src/heuristics/spoofDetector.js",
+    "src/heuristics/localScorer.js",
+    "src/ui/tooltip.js",
+    "src/ui/badge.js",
+    "src/ui/riskBanner.js",
+    "src/content/gmail/extractor.js",
+    "src/content/outlook/extractor.js",
+    "src/content/generic/extractor.js",
+    "src/content/domObserver.js",
+    "src/content/injector.js"
+  ];
   const status = document.getElementById("status");
   const resultBox = document.getElementById("result");
   const riskScore = document.getElementById("riskScore");
@@ -41,7 +59,12 @@
       if (!tabId) {
         throw new Error("No active tab found.");
       }
-      return sendTabMessage(tabId, message);
+      return sendTabMessage(tabId, message).catch((error) => {
+        if (!isMissingReceiverError(error)) {
+          throw error;
+        }
+        return injectContentScripts(tabId).then(() => sendTabMessage(tabId, message));
+      });
     });
   }
 
@@ -85,6 +108,43 @@
         resolve(response);
       });
     });
+  }
+
+  function injectContentScripts(tabId) {
+    if (!extensionApi.scripting?.executeScript) {
+      throw new Error("Open a supported Gmail or Outlook email, then try again.");
+    }
+    try {
+      const result = extensionApi.scripting.executeScript({
+        target: { tabId },
+        files: CONTENT_SCRIPT_FILES
+      });
+      if (result && typeof result.then === "function") {
+        return result;
+      }
+    } catch (_error) {
+      // Chrome callback mode is handled below.
+    }
+    return new Promise((resolve, reject) => {
+      extensionApi.scripting.executeScript(
+        {
+          target: { tabId },
+          files: CONTENT_SCRIPT_FILES
+        },
+        () => {
+          const lastError = typeof chrome !== "undefined" ? chrome.runtime?.lastError : null;
+          if (lastError) {
+            reject(new Error("Open a supported Gmail or Outlook email, then try again."));
+            return;
+          }
+          resolve();
+        }
+      );
+    });
+  }
+
+  function isMissingReceiverError(error) {
+    return /receiving end does not exist|could not establish connection/i.test(error?.message || "");
   }
 
   function renderResult(result = {}) {

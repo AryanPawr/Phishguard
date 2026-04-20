@@ -3,7 +3,7 @@
   "name": "PhishGuard",
   "version": "0.1.0",
   "description": "Privacy-preserving phishing risk detection for webmail and email-rendered pages.",
-  "permissions": ["storage", "activeTab"],
+  "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": [
     "https://phishguard-backend-anw5.onrender.com/*",
     "http://localhost:8000/*",
