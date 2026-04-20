@@ -4,6 +4,14 @@ class PhishGuardApiClient {
     this.cacheVersion = "v3";
   }
 
+  defaultSettings() {
+    return {
+      apiBaseUrl: "https://phishguard-backend-anw5.onrender.com/api",
+      suspiciousThreshold: 0.28,
+      cacheTtlMinutes: 60
+    };
+  }
+
   getExtensionApi() {
     if (typeof browser !== "undefined" && browser.storage?.local) {
       return browser;
@@ -71,9 +79,7 @@ class PhishGuardApiClient {
   async getSettings() {
     const stored = await this.storageGet("phishguardSettings");
     return {
-      apiBaseUrl: "http://localhost:8000/api",
-      suspiciousThreshold: 0.28,
-      cacheTtlMinutes: 60,
+      ...this.defaultSettings(),
       ...(stored.phishguardSettings || {})
     };
   }

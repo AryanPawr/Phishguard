@@ -153,6 +153,18 @@ Change these in `backend/.env` before using the project outside local developmen
 
 The extension will call the local backend and display a risk banner when supported pages are opened.
 
+## Production Integration
+
+Current deployed endpoints:
+
+- Backend URL: `https://phishguard-backend-anw5.onrender.com`
+- Dashboard URL: `https://phishguard-dashboard.vercel.app`
+- Dashboard env var: `VITE_API_BASE_URL=https://phishguard-backend-anw5.onrender.com/api`
+- Backend CORS env var: `PHISHGUARD_CORS_ORIGINS=https://phishguard-dashboard.vercel.app`
+- Extension default API URL: `https://phishguard-backend-anw5.onrender.com/api`
+
+The backend reads CORS origins from `PHISHGUARD_CORS_ORIGINS`; keep localhost values only in local `.env` files when running the dashboard locally.
+
 ## Running the Test Suite
 
 From the project root:

@@ -6,11 +6,7 @@ const extensionApi = typeof browser !== "undefined" ? browser : chrome;
 
 extensionApi.runtime.onInstalled.addListener(() => {
   extensionApi.storage.local.set({
-    phishguardSettings: {
-      apiBaseUrl: "http://localhost:8000/api",
-      suspiciousThreshold: 0.28,
-      cacheTtlMinutes: 60
-    }
+    phishguardSettings: apiClient.defaultSettings()
   });
 });
 

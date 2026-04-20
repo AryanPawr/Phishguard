@@ -5,6 +5,7 @@
   "description": "Privacy-preserving phishing risk detection for webmail and email-rendered pages.",
   "permissions": ["storage", "activeTab"],
   "host_permissions": [
+    "https://phishguard-backend-anw5.onrender.com/*",
     "http://localhost:8000/*",
     "https://mail.google.com/*",
     "https://outlook.live.com/*",
@@ -41,7 +42,7 @@
     }
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'self' http://localhost:8000 https://api.phishguard.local"
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'self' https://phishguard-backend-anw5.onrender.com http://localhost:8000 https://api.phishguard.local"
   },
   "browser_specific_settings": {
     "gecko": {
